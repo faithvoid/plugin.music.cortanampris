@@ -7,6 +7,16 @@ PORT = 50505
 title_str = "cortanaMPRIS"
 
 def show_notification(title, message, image=None):
+    # Ensure title and message are Unicode
+    if isinstance(title, str):
+        title = title.decode('utf-8', 'replace')
+    if isinstance(message, str):
+        message = message.decode('utf-8', 'replace')
+
+    # Encode back to UTF-8 before passing to xbmc
+    title = title.encode('utf-8')
+    message = message.encode('utf-8')
+
     if image:
         xbmc.executebuiltin('Notification("%s", "%s", 5000, "%s")' % (title, message, image))
     else:
@@ -29,9 +39,9 @@ def start_server():
                 header += chunk
 
             parts = header.strip().decode('utf-8').split("|||")
-            if len(parts) != 4:
+            if len(parts) != 6:
                 continue
-            title, artist, length_str, playback_status = parts
+            title, artist, album, year, length_str, playback_status = parts
             image_len = int(length_str)
 
             image_data = b''
@@ -60,6 +70,24 @@ def start_server():
                 msg = u"Playback stopped."
             else:
                 msg = u"%s - %s" % (artist, title)
+
+            track_info = u"%s - %s" % (artist, title)
+            if album:
+                track_info += u" (%s" % album
+                if year:
+                    track_info += u", %s" % year
+                track_info += u")"
+            elif year:
+                track_info += u" (%s)" % year
+
+            if playback_status == "Playing":
+                msg = u"Playing: %s" % track_info
+            elif playback_status == "Paused":
+                msg = u"Paused: %s" % track_info
+            elif playback_status == "Stopped":
+                msg = u"Playback stopped."
+            else:
+                msg = track_info
 
             show_notification(title_str, msg, image_path)
 
