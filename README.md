@@ -1,5 +1,5 @@
 # cortanaMPRIS
-## MPRIS notification utility for XBMC4Xbox
+## MPRIS media notification utility for XBMC4Xbox
 
 ![](screenshots/menu.jpg)
 ![](screenshots/1.jpg)
