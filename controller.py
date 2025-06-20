@@ -13,18 +13,19 @@ import xbmcaddon
 
 # Plugin handle
 handle = int(sys.argv[1])
-addon = xbmcaddon.Addon()
+addon = xbmcaddon.Addon('plugin.music.cortanaMPRIS')
 
 # Remote MPRIS host and ports
-HOST = '192.168.1.110'
-CMD_PORT = 50506
-STATUS_PORT = 50506
-COVER_ART = xbmc.translatePath("special://temp/mpris.jpg")
+HOST = addon.getSetting('ip')
+CMD_PORT = int(addon.getSetting('port'))
+STATUS_PORT = int(addon.getSetting('port'))
+COVER_ART = xbmc.translatePath("Q://UserData//mpris.jpg")
 
 COMMANDS = [
     ("Stop", "stop"),
     ("Previous", "previous"),
     ("Next", "next"),
+    ("Playlist", "playlist"),
     ("Refresh", "refresh"),
     ("Notifications", "notifier")
 ]
@@ -38,6 +39,41 @@ def send_command(cmd):
     except Exception as e:
         msg = "Error: %s" % str(e)
         xbmc.executebuiltin('Notification(cortanaMPRIS, %s, 3000)' % msg)
+
+def fetch_cover_art():
+    # Request cover art from the server and save to COVER_ART
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((HOST, CMD_PORT))
+        s.sendall(b"coverart")
+        # Now read header (image length)
+        header = b''
+        while not header.endswith(b'\n'):
+            chunk = s.recv(1)
+            if not chunk:
+                break
+            header += chunk
+        if not header:
+            xbmc.log("No header received for cover art!", xbmc.LOGERROR)
+            s.close()
+            return
+        img_size = int(header.strip())
+        img_bytes = b''
+        while len(img_bytes) < img_size:
+            chunk = s.recv(min(4096, img_size - len(img_bytes)))
+            if not chunk:
+                break
+            img_bytes += chunk
+        s.close()
+        if img_bytes:
+            with open(COVER_ART, 'wb') as f:
+                f.write(img_bytes)
+            xbmc.log("Fetched cover art (%d bytes)" % img_size, xbmc.LOGINFO)
+        else:
+            xbmc.log("No cover art bytes received!", xbmc.LOGWARNING)
+    except Exception as e:
+        xbmc.log("Failed to fetch cover art: %s" % str(e), xbmc.LOGERROR)
 
 def get_status_line():
     try:
@@ -83,13 +119,9 @@ def router(paramstring):
                 send_command("pause")
             else:
                 send_command("play")
-            time.sleep(0.5)
-            xbmc.executebuiltin('Container.Refresh')
 
         elif cmd in ["next", "previous"]:
             send_command(cmd)
-            time.sleep(0.5)
-            xbmc.executebuiltin('Container.Refresh')
 
         elif cmd == "refresh":
             xbmc.executebuiltin('Container.Refresh')
@@ -101,22 +133,23 @@ def router(paramstring):
             send_command(cmd)
 
 def build_list():
+    fetch_cover_art()
     status_line = get_status_line()
     toggle_url = sys.argv[0] + '?cmd=toggle'
 
     li = xbmcgui.ListItem(status_line)
-    
     if os.path.isfile(COVER_ART):
         li.setThumbnailImage(COVER_ART)
 
     li.setInfo(type='music', infoLabels={"title": status_line})
-    xbmcplugin.addDirectoryItem(handle=handle, url=toggle_url, listitem=li, isFolder=False)
+    xbmcplugin.addDirectoryItem(handle=handle, url=toggle_url, listitem=li, isFolder=True)
 
     for label, cmd in COMMANDS:
         url = sys.argv[0] + '?cmd=' + urllib.quote(cmd)
         li = xbmcgui.ListItem(label)
-        xbmcplugin.addDirectoryItem(handle=handle, url=url, listitem=li, isFolder=False)
+        xbmcplugin.addDirectoryItem(handle=handle, url=url, listitem=li, isFolder=True)
 
+    # Disable caching here
     xbmcplugin.endOfDirectory(handle, cacheToDisc=False)
 
 def read_notifier_startup():
