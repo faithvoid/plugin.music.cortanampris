@@ -22,3 +22,4 @@
 
 ## Bugs:
 - "Pause" is a bit slow due to having to work around a play/pause flicker issue with web apps like Spotify.
+- Getting two notifications too close in a row may lead to the last notification having the notification previous to that one's cover art. This is due to XBMC4Xbox locking files used as icons for notifications, not much I can do about that AFAIK! This is also why the notification utility and control utility use different icon names despite usually retrieving the same information.
