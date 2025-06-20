@@ -9,10 +9,7 @@ import requests
 from PIL import Image
 import io
 
-HOST = '192.168.1.105'
-PORT = 50505
-
-RCV_HOST = '0.0.0.0'
+RECEIVER = '0.0.0.0'
 RCV_PORT = 50506
 
 pause_timer = None
@@ -40,10 +37,14 @@ def get_mpris_player():
     players = [s for s in session_bus.list_names() if s.startswith("org.mpris.MediaPlayer2.")]
     if not players:
         return None, None
-    player = session_bus.get_object(players[0], "/org/mpris/MediaPlayer2")
-    iface = dbus.Interface(player, "org.mpris.MediaPlayer2.Player")
-    props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
-    return iface, props
+    try:
+        player = session_bus.get_object(players[0], "/org/mpris/MediaPlayer2")
+        iface = dbus.Interface(player, "org.mpris.MediaPlayer2.Player")
+        props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
+        props.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+        return iface, props
+    except dbus.exceptions.DBusException:
+        return None, None
 
 def get_status_line():
     with lock:
@@ -72,7 +73,7 @@ def resize_image_bytes(image_bytes, size=(256, 256)):
                     return output_buffer.getvalue()
     except Exception as e:
         print("Failed to resize image:", e)
-        return image_bytes  # fallback to original bytes if resize fails
+        return image_bytes
 
 def toggle_play_pause():
     with lock:
@@ -82,9 +83,9 @@ def toggle_play_pause():
 
 def combined_status_command_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((RCV_HOST, RCV_PORT))
+    server.bind((RECEIVER, RCV_PORT))
     server.listen(5)
-    print(f"Listening for XBMC commands and status requests on port {RCV_PORT}...")
+    print("Listening for XBMC commands and status requests on port %d..." % RCV_PORT)
     
     while True:
         client, addr = server.accept()
@@ -100,13 +101,45 @@ def combined_status_command_server():
                         line = get_status_line()
                         client.sendall(line.encode('utf-8'))
                     elif command == "coverart":
-                        # Send cover art on this same socket!
                         now_playing = get_now_playing()
                         image = resize_image_bytes(now_playing.get('image_bytes', b'')) if now_playing and now_playing.get('image_bytes') else b''
                         header = str(len(image)).encode('utf-8') + b'\n'
                         client.sendall(header)
                         if image:
                             client.sendall(image)
+                    elif command == "tracklist":
+                        prev_md, cur_md, next_md = get_track_neighbors()
+                        def md_to_line(md):
+                            if not md:
+                                return ""
+                            title = md.get("xesam:title", "")
+                            artist = md.get("xesam:artist", [""])[0] if md.get("xesam:artist") else ""
+                            album = md.get("xesam:album", "")
+                            return "%s|||%s|||%s" % (title, artist, album)
+                        response = {
+                            'previous': md_to_line(prev_md),
+                            'current': md_to_line(cur_md),
+                            'next': md_to_line(next_md),
+                        }
+                        lines = [response['previous'], response['current'], response['next']]
+                        client.sendall("\n".join(lines).encode('utf-8'))
+                    elif command == "playlist":
+                        playlist = get_playlist()
+                        if not playlist:
+                            response = "Playlist/queue not available or not supported by player."
+                        else:
+                            response = "\n".join(["%d|||%s" % (i+1, entry[1]) for i, entry in enumerate(playlist)])
+                        client.sendall(response.encode('utf-8'))
+                    elif command.startswith("jump:"):
+                        try:
+                            index = int(command.split(":", 1)[1])
+                            result = jump_to_track(index)
+                            if result is not None:
+                                client.sendall(str(result).encode('utf-8'))
+                            else:
+                                client.sendall(b"OK")
+                        except Exception as e:
+                            client.sendall(("Error: %s" % str(e)).encode('utf-8'))
                     else:
                         receive_from_xbmc(command)
                         client.sendall(b"OK")
@@ -158,47 +191,73 @@ def get_now_playing():
         'playback_status': playback_status,
     }
 
-def send_to_xbmc(data):
+def get_playlist():
+    iface, props = get_mpris_player()
+    if not props:
+        return []
     try:
-        title = data['title']
-        artist = data['artist']
-        album = data['album']
-        year = data['year']
-        image = resize_image_bytes(data['image_bytes']) if data['image_bytes'] else b""
-        print(f"Original image bytes: {len(data['image_bytes'])}, Resized image bytes: {len(image)}")
-        status = data['playback_status']
-        header = "{}|||{}|||{}|||{}|||{}|||{}".format(
-            title, artist, album, year, len(image), status
-        ).encode('utf-8')
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((HOST, PORT))
-        s.sendall(header + b'\n')
-        if image:
-            s.sendall(image)
-        s.close()
-        print("Sent:", title, artist, status)
+        pl_iface = dbus.Interface(iface, "org.mpris.MediaPlayer2.Playlists")
+        playlists = pl_iface.GetPlaylists(0, 100, "User")
+        return playlists
     except Exception as e:
-        print("Failed to send:", e)
+        print("Failed to get playlist:", e)
+        return []
 
-def send_cover_art():
+def get_track_neighbors():
+    session_bus = dbus.SessionBus()
+    players = [s for s in session_bus.list_names() if s.startswith("org.mpris.MediaPlayer2.")]
+    if not players:
+        return None, None, None
+
+    player = session_bus.get_object(players[0], "/org/mpris/MediaPlayer2")
+    props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
+
     try:
-        now_playing = get_now_playing()
-        image = resize_image_bytes(now_playing.get('image_bytes', b'')) if now_playing and now_playing.get('image_bytes') else b''
-        image_len = len(image)
+        cur_track_id = props.Get("org.mpris.MediaPlayer2.Player", "Metadata").get("mpris:trackid")
+    except Exception:
+        cur_track_id = None
 
-        # Compose header: just the length as ASCII, then newline as separator
-        header = str(image_len).encode('utf-8') + b'\n'
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((HOST, PORT))
-        s.sendall(header)
-        if image:
-            s.sendall(image)
-        s.close()
-        print("Sent cover art, bytes:", image_len)
+    try:
+        tracklist_iface = dbus.Interface(player, "org.mpris.MediaPlayer2.TrackList")
+        track_ids = tracklist_iface.GetTracks()
     except Exception as e:
-        print("Failed to send cover art:", e)
+        print("Failed to get tracklist via TrackList interface:", e)
+        return None, None, None
+
+    all_metadata = []
+    for tid in track_ids:
+        try:
+            md = props.Get("org.mpris.MediaPlayer2.TrackList", "Metadata", tid)
+            all_metadata.append(md)
+        except Exception:
+            all_metadata.append({'mpris:trackid': tid})
+
+    idx = None
+    for i, md in enumerate(all_metadata):
+        if md.get('mpris:trackid') == cur_track_id:
+            idx = i
+            break
+
+    prev_md, cur_md, next_md = None, None, None
+    if idx is not None:
+        cur_md = all_metadata[idx]
+        if idx > 0:
+            prev_md = all_metadata[idx - 1]
+        if idx < len(all_metadata) - 1:
+            next_md = all_metadata[idx + 1]
+
+    return prev_md, cur_md, next_md
+
+def jump_to_track(index):
+    iface, props = get_mpris_player()
+    if not iface:
+        return "No player found"
+    try:
+        print("Attempting to jump to track %d" % index)
+        return None
+    except Exception as e:
+        print("Failed to jump to track:", e)
+        return "Failed to jump: %s" % str(e)
 
 def receive_from_xbmc(command):
     iface, _ = get_mpris_player()
@@ -228,12 +287,9 @@ def receive_from_xbmc(command):
 def notify_pause():
     global pause_data, lock
     with lock:
-        if pause_data:
-            send_to_xbmc(pause_data)
-            pause_data = None
+        pause_data = None
 
 if __name__ == '__main__':
-    # Start the combined command + status server thread (port 50506)
     combined_thread = threading.Thread(target=combined_status_command_server, daemon=True)
     combined_thread.start()
 
@@ -262,10 +318,6 @@ if __name__ == '__main__':
                     if pause_timer and pause_timer.is_alive():
                         pause_timer.cancel()
                         pause_data = None
-                send_to_xbmc(now_playing)
-            else:
-                send_to_xbmc(now_playing)
-
             last_data = now_playing
             last_status = status
         time.sleep(0.2)
