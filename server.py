@@ -10,7 +10,7 @@ from PIL import Image
 import io
 
 RECEIVER = '0.0.0.0'
-RCV_PORT = 50506
+RCV_PORT = 50505
 
 pause_timer = None
 pause_data = None
@@ -260,13 +260,16 @@ def jump_to_track(index):
         return "Failed to jump: %s" % str(e)
 
 def receive_from_xbmc(command):
-    iface, _ = get_mpris_player()
-    if not iface:
+    iface, player = get_mpris_player()
+    if not iface or not player:
         print("No MPRIS player found")
         return
 
     command = command.strip().lower()
+
     try:
+        props_iface = dbus.Interface(player, dbus_interface='org.freedesktop.DBus.Properties')
+
         if command == "play":
             iface.Play()
         elif command == "pause":
@@ -277,19 +280,40 @@ def receive_from_xbmc(command):
             iface.Previous()
         elif command == "next":
             iface.Next()
+        elif command == "volumeup":
+            current_volume = props_iface.Get('org.mpris.MediaPlayer2.Player', 'Volume')
+            new_volume = min(current_volume + 0.05, 1.0)
+            props_iface.Set('org.mpris.MediaPlayer2.Player', 'Volume', dbus.Double(new_volume))
+            print(f"Volume increased to {new_volume:.2f}")
+        elif command == "volumedown":
+            current_volume = props_iface.Get('org.mpris.MediaPlayer2.Player', 'Volume')
+            new_volume = max(current_volume - 0.05, 0.0)
+            props_iface.Set('org.mpris.MediaPlayer2.Player', 'Volume', dbus.Double(new_volume))
+            print(f"Volume decreased to {new_volume:.2f}")
         else:
             print(f"Unknown command: {command}")
             return
+
         print(f"Executed MPRIS command: {command}")
+
     except Exception as e:
         print(f"Failed to send command '{command}':", e)
+
 
 def notify_pause():
     global pause_data, lock
     with lock:
         pause_data = None
 
+def udp_broadcast_thread():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    while True:
+        sock.sendto(b"CORTANAMPRIS_HERE", ('<broadcast>', 50507))
+        time.sleep(3)
+
 if __name__ == '__main__':
+    threading.Thread(target=udp_broadcast_thread, daemon=True).start()
     combined_thread = threading.Thread(target=combined_status_command_server, daemon=True)
     combined_thread.start()
 
