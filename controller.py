@@ -16,19 +16,51 @@ handle = int(sys.argv[1])
 addon = xbmcaddon.Addon('plugin.music.cortanaMPRIS')
 
 # Remote MPRIS host and ports
-HOST = addon.getSetting('ip')
-CMD_PORT = int(addon.getSetting('port'))
-STATUS_PORT = int(addon.getSetting('port'))
-COVER_ART = xbmc.translatePath("Q://UserData//mpris.jpg")
+CMD_PORT = 50506
+STATUS_PORT = 50506
+DISCOVERY_PORT = 50507
+COVER_ART = xbmc.translatePath("Q://UserData//mpris_thumb.jpg")
 
 COMMANDS = [
     ("Stop", "stop"),
     ("Previous", "previous"),
     ("Next", "next"),
-    ("Playlist", "playlist"),
+    ("Volume +", "volumeup"),
+    ("Volume -", "volumedown"),
     ("Refresh", "refresh"),
     ("Notifications", "notifier")
 ]
+
+def discover_server_ip(timeout=5):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(('', DISCOVERY_PORT))
+        sock.settimeout(timeout)
+        xbmc.log("Waiting for UDP broadcast on port %d..." % DISCOVERY_PORT, xbmc.LOGINFO)
+
+        while True:
+            data, addr = sock.recvfrom(1024)
+            if data.strip() == b"CORTANAMPRIS_HERE":
+                xbmc.log("Discovered server at: %s" % addr[0], xbmc.LOGINFO)
+                response_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                response_sock.sendto(b"CORTANAMPRIS_FOUND", addr)
+                response_sock.close()
+                return addr[0]
+    except Exception as e:
+        xbmc.log("UDP discovery failed: %s" % str(e), xbmc.LOGERROR)
+    return None
+
+def get_server_ip():
+    ip = addon.getSetting('ip')
+    if ip:
+        xbmc.log("Using static IP from settings: %s" % ip, xbmc.LOGINFO)
+        return ip.strip()
+    else:
+        xbmc.log("No IP configured, falling back to discovery", xbmc.LOGINFO)
+        return discover_server_ip()
+
+HOST = get_server_ip()
 
 def send_command(cmd):
     try:
@@ -41,13 +73,16 @@ def send_command(cmd):
         xbmc.executebuiltin('Notification(cortanaMPRIS, %s, 3000)' % msg)
 
 def fetch_cover_art():
-    # Request cover art from the server and save to COVER_ART
+    host = get_server_ip()
+    if not host:
+        xbmc.log("No server IP available to fetch cover art.", xbmc.LOGERROR)
+        return
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect((HOST, CMD_PORT))
         s.sendall(b"coverart")
-        # Now read header (image length)
+        # Read header (image length)
         header = b''
         while not header.endswith(b'\n'):
             chunk = s.recv(1)
@@ -75,38 +110,112 @@ def fetch_cover_art():
     except Exception as e:
         xbmc.log("Failed to fetch cover art: %s" % str(e), xbmc.LOGERROR)
 
-def get_status_line():
+def build_playlist():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((HOST, CMD_PORT))
+        s.sendall(b"playlist")
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        playlist_lines = data.decode("utf-8").strip().split("\n")
+        if not playlist_lines or playlist_lines == ['']:
+            xbmcgui.Dialog().ok("Playlist", "No playlist available or unsupported by player.")
+            xbmcplugin.endOfDirectory(handle, cacheToDisc=False)
+            return
+
+        for line in playlist_lines:
+            # Expecting "index|||title"
+            if '|||' in line:
+                idx, title = line.split('|||', 1)
+            else:
+                idx, title = str(playlist_lines.index(line)+1), line
+            url = sys.argv[0] + '?cmd=jump&idx=%s' % idx
+            li = xbmcgui.ListItem(title)
+            xbmcplugin.addDirectoryItem(handle=handle, url=url, listitem=li, isFolder=False)
+        xbmcplugin.endOfDirectory(handle, cacheToDisc=False)
+    except Exception as e:
+        xbmcgui.Dialog().ok("Playlist Error", str(e))
+        xbmcplugin.endOfDirectory(handle, cacheToDisc=False)
+
+def get_neighbors():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
+        s.connect((HOST, CMD_PORT))
+        s.sendall(b"tracklist")
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        lines = data.decode('utf-8').split('\n')
+        # Expected: previous, current, next
+        prev_str, next_str = '', ''
+        if len(lines) >= 1 and lines[0].strip():
+            prev_parts = lines[0].split('|||')
+            if prev_parts and prev_parts[0].strip():
+                prev_str = "Previous: %s - %s" % (prev_parts[0], prev_parts[1]) if len(prev_parts) > 1 else "Previous: %s" % prev_parts[0]
+        if len(lines) >= 3 and lines[2].strip():
+            next_parts = lines[2].split('|||')
+            if next_parts and next_parts[0].strip():
+                next_str = "Next: %s - %s" % (next_parts[0], next_parts[1]) if len(next_parts) > 1 else "Next: %s" % next_parts[0]
+        return prev_str, next_str
+    except Exception as e:
+        return '', ''
+
+def get_status_line():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2)
         s.connect((HOST, STATUS_PORT))
-        s.sendall(b"status")   # <-- send "status" request immediately
+        s.sendall(b"status")
         data = s.recv(1024)
         s.close()
         if data:
-            status = data.decode('utf-8').strip()
-            if status.lower().startswith("paused"):
-                # Wait a moment and check again
-                time.sleep(3)
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(3)
-                    s.connect((HOST, STATUS_PORT))
-                    s.sendall(b"status")  # send again
-                    data2 = s.recv(1024)
-                    s.close()
-                    if data2:
-                        second_status = data2.decode('utf-8').strip()
-                        if second_status.lower().startswith("playing"):
-                            return second_status
-                except:
-                    pass  # fallback to original status
-            return status
+            return data.decode('utf-8').strip()
     except Exception as e:
         return "Could not get status: " + str(e)
     return "No status available"
 
 
+def show_playlist():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((HOST, CMD_PORT))
+        s.sendall(b"playlist")
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        playlist_lines = data.decode("utf-8").strip().split("\n")
+        if not playlist_lines or playlist_lines == ['']:
+            xbmcgui.Dialog().ok("Playlist", "No playlist available or unsupported by player.")
+            return
+
+        # Present as a selectable dialog
+        selected = xbmcgui.Dialog().select("Playlist Queue", playlist_lines)
+        if selected >= 0:
+            # User selected a track; send jump command
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((HOST, CMD_PORT))
+            cmd = "jump:%d" % (selected+1)
+            s.sendall(cmd.encode('utf-8'))
+            s.close()
+    except Exception as e:
+        xbmcgui.Dialog().ok("Playlist Error", str(e))
 
 def router(paramstring):
     params = dict(part.split('=') for part in paramstring[1:].split('&') if '=' in part)
@@ -126,9 +235,26 @@ def router(paramstring):
         elif cmd == "refresh":
             xbmc.executebuiltin('Container.Refresh')
 
+        elif cmd == "volumeup":
+            send_command(cmd)
+
+        elif cmd == "volumedown":
+            send_command(cmd)
+
         elif cmd == "notifier":
             start_notifier()
 
+        elif cmd == "playlist":
+            build_playlist()
+        elif cmd == "jump" and 'idx' in params:
+            idx = params['idx']
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((HOST, CMD_PORT))
+            cmdstr = "jump:%s" % idx
+            s.sendall(cmdstr.encode('utf-8'))
+            s.close()
+            xbmc.executebuiltin('Container.Refresh')
         else:
             send_command(cmd)
 
@@ -167,6 +293,7 @@ def start_notifier():
     if os.path.isfile(notifier_path):
         try:
             xbmc.executebuiltin('RunScript("%s")' % notifier_path)
+            time.sleep(3)
             xbmc.log("Started notifier.py using RunScript", xbmc.LOGINFO)
         except Exception as e:
             xbmc.log("Failed to start notifier.py: %s" % e, xbmc.LOGERROR)
