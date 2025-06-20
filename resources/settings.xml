@@ -1,0 +1,8 @@
+<settings>
+    <category label="cortanaMPRIS">
+    <setting type="lsep" label="cortanaMPRIS" />
+    <setting id="ip" type="text" label="IP address:" default=""/>
+    <setting id="port" type="text" label="Port:" default=""/>
+    <setting id="notifier_startup" type="bool" label="Enable MPRIS notifier on startup" default="true" />
+    </category>
+</settings>
