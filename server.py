@@ -15,9 +15,6 @@ PORT = 50505
 RCV_HOST = '0.0.0.0'
 RCV_PORT = 50506
 
-STATUS_SERVER_HOST = '0.0.0.0'
-STATUS_SERVER_PORT = 50507
-
 pause_timer = None
 pause_data = None
 lock = threading.Lock()
@@ -25,20 +22,44 @@ lock = threading.Lock()
 last_track_info = {
     'title': '',
     'artist': '',
+    'album': '',
+    'year': '',
     'status': '',  # "Playing", "Paused", or other
 }
+
+def format_track_info(title, artist, album, year):
+    if album and year:
+        return f"{title} - {artist} ({album}, {year})"
+    elif album:
+        return f"{title} - {artist} ({album})"
+    else:
+        return f"{title} - {artist}"
+
+def get_mpris_player():
+    session_bus = dbus.SessionBus()
+    players = [s for s in session_bus.list_names() if s.startswith("org.mpris.MediaPlayer2.")]
+    if not players:
+        return None, None
+    player = session_bus.get_object(players[0], "/org/mpris/MediaPlayer2")
+    iface = dbus.Interface(player, "org.mpris.MediaPlayer2.Player")
+    props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
+    return iface, props
 
 def get_status_line():
     with lock:
         status = last_track_info['status']
         title = last_track_info['title']
         artist = last_track_info['artist']
-    if status.lower() == "playing":
-        return f"Playing: {title} - {artist}"
-    elif status.lower() == "paused":
-        return f"Paused: {title} - {artist}"
+        album = last_track_info.get('album', '')
+        year = last_track_info.get('year', '')
+    info_str = format_track_info(title, artist, album, year)
+    status_lower = status.lower()
+    if status_lower == "playing":
+        return f"Playing: {info_str}"
+    elif status_lower == "paused":
+        return f"Paused: {info_str}"
     else:
-        return f"{status}: {title} - {artist}"
+        return f"{status}: {info_str}"
 
 def resize_image_bytes(image_bytes, size=(256, 256)):
     try:
@@ -53,36 +74,45 @@ def resize_image_bytes(image_bytes, size=(256, 256)):
         print("Failed to resize image:", e)
         return image_bytes  # fallback to original bytes if resize fails
 
-
 def toggle_play_pause():
     with lock:
         status = last_track_info['status']
-    if status.lower() == "playing":
-        receive_from_xbmc("pause")
-    else:
-        receive_from_xbmc("play")
+    cmd = "pause" if status.lower() == "playing" else "play"
+    receive_from_xbmc(cmd)
 
-def status_server():
+def combined_status_command_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((STATUS_SERVER_HOST, STATUS_SERVER_PORT))
+    server.bind((RCV_HOST, RCV_PORT))  # Use port 50506
     server.listen(5)
-    print(f"Status server listening on port {STATUS_SERVER_PORT}...")
+    print(f"Listening for XBMC commands and status requests on port {RCV_PORT}...")
+    
     while True:
         client, addr = server.accept()
         with client:
-            # Just send the current status line and close
-            line = get_status_line()
-            client.sendall(line.encode('utf-8'))
+            try:
+                data = client.recv(1024)
+                if not data:
+                    # No data sent; treat as a status request
+                    line = get_status_line()
+                    client.sendall(line.encode('utf-8'))
+                else:
+                    command = data.decode('utf-8').strip().lower()
+                    if command == "status":
+                        # Explicit status request
+                        line = get_status_line()
+                        client.sendall(line.encode('utf-8'))
+                    else:
+                        # Otherwise treat as XBMC command
+                        receive_from_xbmc(command)
+                        client.sendall(b"OK")  # optional response
+            except Exception as e:
+                print("Error handling client:", e)
 
 def get_now_playing():
-    session_bus = dbus.SessionBus()
-    mpris_players = [s for s in session_bus.list_names() if s.startswith("org.mpris.MediaPlayer2.")]
-    if not mpris_players:
+    iface, props = get_mpris_player()
+    if not props:
         return None
 
-    player = session_bus.get_object(mpris_players[0], "/org/mpris/MediaPlayer2")
-    props = dbus.Interface(player, "org.freedesktop.DBus.Properties")
-    
     playback_status = props.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
     metadata = props.Get("org.mpris.MediaPlayer2.Player", "Metadata")
 
@@ -101,15 +131,18 @@ def get_now_playing():
     if art_url.startswith("file://"):
         image_path = urlparse(art_url).path
         if os.path.isfile(image_path):
-            with open(image_path, 'rb') as f:
-                image_bytes = f.read()
+            try:
+                with open(image_path, 'rb') as f:
+                    image_bytes = f.read()
+            except Exception as e:
+                print("Failed to read art file:", e)
     elif art_url.startswith("http"):
         try:
             r = requests.get(art_url, timeout=3)
             if r.ok:
                 image_bytes = r.content
-        except:
-            pass
+        except requests.RequestException as e:
+            print("Failed to fetch art URL:", e)
 
     return {
         'title': title,
@@ -129,7 +162,7 @@ def send_to_xbmc(data):
         image = resize_image_bytes(data['image_bytes']) if data['image_bytes'] else b""
         print(f"Original image bytes: {len(data['image_bytes'])}, Resized image bytes: {len(image)}")
         status = data['playback_status']
-        header = u"{}|||{}|||{}|||{}|||{}|||{}".format(
+        header = "{}|||{}|||{}|||{}|||{}|||{}".format(
             title, artist, album, year, len(image), status
         ).encode('utf-8')
 
@@ -144,14 +177,10 @@ def send_to_xbmc(data):
         print("Failed to send:", e)
 
 def receive_from_xbmc(command):
-    session_bus = dbus.SessionBus()
-    mpris_players = [s for s in session_bus.list_names() if s.startswith("org.mpris.MediaPlayer2.")]
-    if not mpris_players:
+    iface, _ = get_mpris_player()
+    if not iface:
         print("No MPRIS player found")
         return
-
-    player = session_bus.get_object(mpris_players[0], "/org/mpris/MediaPlayer2")
-    iface = dbus.Interface(player, "org.mpris.MediaPlayer2.Player")
 
     command = command.strip().lower()
     try:
@@ -172,20 +201,6 @@ def receive_from_xbmc(command):
     except Exception as e:
         print(f"Failed to send command '{command}':", e)
 
-def xbmc_command_listener():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((RCV_HOST, RCV_PORT))  # Match PORT in XBMC add-on
-    server.listen(5)
-    print("Listening for XBMC commands on port 50506...")
-    
-    while True:
-        client, addr = server.accept()
-        with client:
-            data = client.recv(1024)
-            if data:
-                command = data.decode('utf-8').strip()
-                receive_from_xbmc(command)
-
 def notify_pause():
     global pause_data, lock
     with lock:
@@ -194,13 +209,8 @@ def notify_pause():
             pause_data = None
 
 if __name__ == '__main__':
-    # Start the command listener thread (port 50506)
-    listener_thread = threading.Thread(target=xbmc_command_listener, daemon=True)
-    listener_thread.start()
-
-    # Start the status server thread (port 50507)
-    status_thread = threading.Thread(target=status_server, daemon=True)
-    status_thread.start()
+    combined_thread = threading.Thread(target=combined_status_command_server, daemon=True)
+    combined_thread.start()
 
     last_data = None
     last_status = None
@@ -211,6 +221,8 @@ if __name__ == '__main__':
             with lock:
                 last_track_info['title'] = now_playing['title']
                 last_track_info['artist'] = now_playing['artist']
+                last_track_info['album'] = now_playing['album']
+                last_track_info['year'] = now_playing['year']
                 last_track_info['status'] = status
 
             if status == "Paused":
