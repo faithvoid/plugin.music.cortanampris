@@ -65,10 +65,10 @@ def resize_image_bytes(image_bytes, size=(256, 256)):
     try:
         with io.BytesIO(image_bytes) as input_buffer:
             with Image.open(input_buffer) as img:
-                img = img.convert('RGBA')
+                img = img.convert('RGB')
                 img.thumbnail(size, Image.LANCZOS)
                 with io.BytesIO() as output_buffer:
-                    img.save(output_buffer, format='PNG')
+                    img.save(output_buffer, format='JPEG')
                     return output_buffer.getvalue()
     except Exception as e:
         print("Failed to resize image:", e)
@@ -82,7 +82,7 @@ def toggle_play_pause():
 
 def combined_status_command_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((RCV_HOST, RCV_PORT))  # Use port 50506
+    server.bind((RCV_HOST, RCV_PORT))
     server.listen(5)
     print(f"Listening for XBMC commands and status requests on port {RCV_PORT}...")
     
@@ -92,19 +92,24 @@ def combined_status_command_server():
             try:
                 data = client.recv(1024)
                 if not data:
-                    # No data sent; treat as a status request
                     line = get_status_line()
                     client.sendall(line.encode('utf-8'))
                 else:
                     command = data.decode('utf-8').strip().lower()
                     if command == "status":
-                        # Explicit status request
                         line = get_status_line()
                         client.sendall(line.encode('utf-8'))
+                    elif command == "coverart":
+                        # Send cover art on this same socket!
+                        now_playing = get_now_playing()
+                        image = resize_image_bytes(now_playing.get('image_bytes', b'')) if now_playing and now_playing.get('image_bytes') else b''
+                        header = str(len(image)).encode('utf-8') + b'\n'
+                        client.sendall(header)
+                        if image:
+                            client.sendall(image)
                     else:
-                        # Otherwise treat as XBMC command
                         receive_from_xbmc(command)
-                        client.sendall(b"OK")  # optional response
+                        client.sendall(b"OK")
             except Exception as e:
                 print("Error handling client:", e)
 
@@ -176,6 +181,25 @@ def send_to_xbmc(data):
     except Exception as e:
         print("Failed to send:", e)
 
+def send_cover_art():
+    try:
+        now_playing = get_now_playing()
+        image = resize_image_bytes(now_playing.get('image_bytes', b'')) if now_playing and now_playing.get('image_bytes') else b''
+        image_len = len(image)
+
+        # Compose header: just the length as ASCII, then newline as separator
+        header = str(image_len).encode('utf-8') + b'\n'
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((HOST, PORT))
+        s.sendall(header)
+        if image:
+            s.sendall(image)
+        s.close()
+        print("Sent cover art, bytes:", image_len)
+    except Exception as e:
+        print("Failed to send cover art:", e)
+
 def receive_from_xbmc(command):
     iface, _ = get_mpris_player()
     if not iface:
@@ -209,6 +233,7 @@ def notify_pause():
             pause_data = None
 
 if __name__ == '__main__':
+    # Start the combined command + status server thread (port 50506)
     combined_thread = threading.Thread(target=combined_status_command_server, daemon=True)
     combined_thread.start()
 
