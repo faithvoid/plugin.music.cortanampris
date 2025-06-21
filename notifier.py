@@ -13,7 +13,7 @@ HOST = None
 lost_connection = False
 
 def get_configured_ip():
-    settings_path = xbmc.translatePath("special://profile/addon_data/plugin.music.cortanaMPRIS/settings.xml")
+    settings_path = xbmc.translatePath("Q:\\UserData\\plugin_data\\music\\cortanaMPRIS\\settings.xml")
     try:
         tree = ET.parse(settings_path)
         root = tree.getroot()
